@@ -1,12 +1,12 @@
 package main
 
 import (
+        "bufio"
         "crypto/aes"
         "crypto/cipher"
         "crypto/rand"
         "crypto/sha256"
         "encoding/base64"
-        "encoding/json"
         "fmt"
         "io"
         "io/ioutil"
@@ -17,6 +17,7 @@ import (
         "sync"
         "time"
 
+        json "github.com/json-iterator/go"
         "github.com/fsnotify/fsnotify"
         tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -435,26 +436,31 @@ func (tb *TelegramBot) startFileWatcher() {
         }
 }
 
-// Get latest detected symbol from upbit_new.json
+// Get latest detected symbol from upbit_new.jsonl
 func (tb *TelegramBot) getLatestDetectedSymbol() string {
-        data, err := ioutil.ReadFile("upbit_new.json")
+        file, err := os.Open("upbit_new.json")
         if err != nil {
                 log.Printf("Warning: Could not read upbit_new.json: %v", err)
                 return ""
         }
+        defer file.Close()
 
-        var upbitData UpbitData
-        if err := json.Unmarshal(data, &upbitData); err != nil {
-                log.Printf("Warning: Could not parse upbit_new.json: %v", err)
-                return ""
+        var lastSymbol string
+        scanner := bufio.NewScanner(file)
+        for scanner.Scan() {
+                line := scanner.Text()
+                if line == "" {
+                        continue
+                }
+
+                var entry ListingEntry
+                if err := json.UnmarshalFromString(line, &entry); err != nil {
+                        continue
+                }
+                lastSymbol = entry.Symbol
         }
 
-        if len(upbitData.Listings) == 0 {
-                return ""
-        }
-
-        // Return the latest (first) detection symbol - Go monitor inserts new listings at index 0
-        return upbitData.Listings[0].Symbol
+        return lastSymbol
 }
 
 // Process upbit_new.json changes and trigger auto-trading

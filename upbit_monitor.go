@@ -1,7 +1,7 @@
 package main
 
 import (
-        "encoding/json"
+        "bufio"
         "fmt"
         "io"
         "log"
@@ -13,6 +13,7 @@ import (
         "sync"
         "time"
 
+        json "github.com/json-iterator/go"
         "golang.org/x/net/proxy"
 )
 
@@ -36,14 +37,15 @@ type ListingEntry struct {
         DetectedAt string `json:"detected_at"`
 }
 
-type ListingsData struct {
-        Listings []ListingEntry `json:"listings"`
-}
-
 // Type aliases for compatibility with telegram_bot.go
 type CoinDetection = ListingEntry
 type UpbitDetection = ListingEntry
 type UpbitData = ListingsData
+
+// ListingsData struct for backward compatibility (now unused in JSONL format)
+type ListingsData struct {
+        Listings []ListingEntry `json:"listings"`
+}
 
 type TradeExecutionLog struct {
         Ticker               string                 `json:"ticker"`
@@ -65,6 +67,7 @@ type ETagChangeLog struct {
         ResponseTimeMs int64  `json:"response_time_ms"`
 }
 
+// ETagChangeData struct for backward compatibility (now unused in JSONL format)
 type ETagChangeData struct {
         Detections []ETagChangeLog `json:"detections"`
 }
@@ -84,9 +87,9 @@ type UpbitMonitor struct {
         etagLogFile      string // ETag change detection log
         currentLogEntry  *TradeExecutionLog
         logMu            sync.Mutex
-        // Intelligent Proxy Pool (Blacklist for rate-limited proxies)
-        proxyBlacklist   map[int]time.Time // proxy index -> blacklist expire time
-        blacklistMu      sync.RWMutex
+        // Intelligent Proxy Pool (Cooldown for rate-limited proxies)
+        proxyCooldowns   map[int]time.Time // proxy index -> cooldown expire time
+        cooldownMu       sync.RWMutex
         // Timezone-based Scheduling
         pauseEnabled     bool
         pauseStart       int // Minutes since midnight (e.g., 13:00 = 780)
@@ -94,6 +97,11 @@ type UpbitMonitor struct {
         timezone         *time.Location
         isPaused         bool
         pauseMu          sync.Mutex
+        // KST Timezone for Upbit compatibility
+        kstLocation      *time.Location
+        // Silent mode for ETag logging
+        lastProcessedETag string
+        lastETagMu       sync.RWMutex
 }
 
 func NewUpbitMonitor(onNewListing func(string)) *UpbitMonitor {
@@ -133,6 +141,13 @@ func NewUpbitMonitor(onNewListing func(string)) *UpbitMonitor {
                 timezone = time.UTC
         }
 
+        // Load KST timezone for Upbit compatibility
+        kstLocation, err := time.LoadLocation("Asia/Seoul")
+        if err != nil {
+                log.Printf("⚠️ Failed to load KST timezone, using UTC")
+                kstLocation = time.UTC
+        }
+
         return &UpbitMonitor{
                 apiURL:           "https://api-manager.upbit.com/api/v1/announcements?os=web&page=1&per_page=20&category=overall",
                 proxies:          proxies,
@@ -142,7 +157,7 @@ func NewUpbitMonitor(onNewListing func(string)) *UpbitMonitor {
                 proxyIndex:       0,
                 jsonFile:         "upbit_new.json",
                 executionLogFile: "trade_execution_log.json",
-                proxyBlacklist:   make(map[int]time.Time), // Initialize blacklist
+                proxyCooldowns:   make(map[int]time.Time), // Initialize cooldowns
                 etagLogFile:      "etag_news.json",
                 onNewListing:     onNewListing,
                 pauseEnabled:     pauseEnabled,
@@ -150,6 +165,8 @@ func NewUpbitMonitor(onNewListing func(string)) *UpbitMonitor {
                 pauseEnd:         pauseEnd,
                 timezone:         timezone,
                 isPaused:         false,
+                kstLocation:      kstLocation,
+                lastProcessedETag: "",
         }
 }
 
@@ -205,40 +222,43 @@ func (um *UpbitMonitor) loadExistingData() error {
                 return nil
         }
 
-        data, err := os.ReadFile(um.jsonFile)
+        file, err := os.Open(um.jsonFile)
         if err != nil {
-                return fmt.Errorf("error reading JSON file: %v", err)
+                return fmt.Errorf("error opening JSONL file: %v", err)
         }
+        defer file.Close()
 
-        var listingsData ListingsData
-        if err := json.Unmarshal(data, &listingsData); err != nil {
-                return fmt.Errorf("error parsing JSON: %v", err)
-        }
+        scanner := bufio.NewScanner(file)
+        count := 0
+        for scanner.Scan() {
+                line := scanner.Text()
+                if line == "" {
+                        continue
+                }
 
-        for _, entry := range listingsData.Listings {
+                var entry ListingEntry
+                if err := json.UnmarshalFromString(line, &entry); err != nil {
+                        log.Printf("Warning: Failed to parse line in JSONL file: %v", err)
+                        continue
+                }
+
                 um.cachedTickers[entry.Symbol] = true
+                count++
         }
 
-        log.Printf("Loaded %d existing symbols from %s", len(um.cachedTickers), um.jsonFile)
+        if err := scanner.Err(); err != nil {
+                return fmt.Errorf("error reading JSONL file: %v", err)
+        }
+
+        log.Printf("Loaded %d existing symbols from %s (JSONL format)", count, um.jsonFile)
         return nil
 }
 
 func (um *UpbitMonitor) saveToJSON(symbol string) error {
-        var data ListingsData
-        if _, err := os.Stat(um.jsonFile); err == nil {
-                fileData, err := os.ReadFile(um.jsonFile)
-                if err != nil {
-                        return fmt.Errorf("error reading existing JSON: %v", err)
-                }
-                json.Unmarshal(fileData, &data)
-        }
-
-        // DUPLICATE CHECK: If symbol already exists in file, skip saving
-        for _, entry := range data.Listings {
-                if entry.Symbol == symbol {
-                        log.Printf("⚠️ DUPLICATE PREVENTED: %s already exists in %s, skipping save", symbol, um.jsonFile)
-                        return nil // Not an error, just skip
-                }
+        // DUPLICATE CHECK: Check if symbol already exists in file
+        if um.cachedTickers[symbol] {
+                log.Printf("⚠️ DUPLICATE PREVENTED: %s already exists in cache, skipping save", symbol)
+                return nil // Not an error, just skip
         }
 
         // Record detection timestamp for trade log
@@ -247,25 +267,25 @@ func (um *UpbitMonitor) saveToJSON(symbol string) error {
         now := time.Now()
         newEntry := ListingEntry{
                 Symbol:     symbol,
-                Timestamp:  now.Format(time.RFC3339),
-                DetectedAt: now.UTC().Format("2006-01-02 15:04:05 UTC"),
+                Timestamp:  now.In(um.kstLocation).Format(time.RFC3339),
+                DetectedAt: now.In(um.kstLocation).Format("2006-01-02 15:04:05 KST"),
         }
 
-        data.Listings = append([]ListingEntry{newEntry}, data.Listings...)
-
-        tempFile := um.jsonFile + ".tmp"
-        jsonData, err := json.MarshalIndent(data, "", "  ")
+        // Append to JSONL file (much faster than reading entire file)
+        file, err := os.OpenFile(um.jsonFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
         if err != nil {
-                return fmt.Errorf("error marshaling JSON: %v", err)
+                return fmt.Errorf("error opening JSONL file for append: %v", err)
+        }
+        defer file.Close()
+
+        // Marshal entry to JSON and write as single line
+        jsonData, err := json.Marshal(newEntry)
+        if err != nil {
+                return fmt.Errorf("error marshaling entry: %v", err)
         }
 
-        if err := os.WriteFile(tempFile, jsonData, 0644); err != nil {
-                return fmt.Errorf("error writing temp file: %v", err)
-        }
-
-        if err := os.Rename(tempFile, um.jsonFile); err != nil {
-                os.Remove(tempFile)
-                return fmt.Errorf("error renaming temp file: %v", err)
+        if _, err := file.Write(append(jsonData, '\n')); err != nil {
+                return fmt.Errorf("error writing to JSONL file: %v", err)
         }
 
         savedAt := time.Now()
@@ -274,13 +294,13 @@ func (um *UpbitMonitor) saveToJSON(symbol string) error {
         um.logMu.Lock()
         um.currentLogEntry = &TradeExecutionLog{
                 Ticker:          symbol,
-                UpbitDetectedAt: detectedAt.Format("2006-01-02 15:04:05.000000"),
-                SavedToFileAt:   savedAt.Format("2006-01-02 15:04:05.000000"),
+                UpbitDetectedAt: detectedAt.In(um.kstLocation).Format("2006-01-02 15:04:05.000000"),
+                SavedToFileAt:   savedAt.In(um.kstLocation).Format("2006-01-02 15:04:05.000000"),
                 LatencyBreakdown: make(map[string]interface{}),
         }
         um.logMu.Unlock()
 
-        log.Printf("✅ Successfully saved NEW listing %s to %s", symbol, um.jsonFile)
+        log.Printf("✅ Successfully saved NEW listing %s to %s (JSONL format)", symbol, um.jsonFile)
         return nil
 }
 
@@ -328,7 +348,6 @@ func isNegativeFiltered(title string) bool {
         
         for _, rule := range negativeRules {
                 if containsAll(title, rule) {
-                        log.Printf("🚫 Negative filter: '%s' (contains: %v)", title, rule)
                         return true
                 }
         }
@@ -358,7 +377,6 @@ func isMaintenanceUpdate(title string) bool {
         }
         
         if containsAny(title, updateKeywords) {
-                log.Printf("🔧 Maintenance/Update filter: '%s'", title)
                 return true
         }
         return false
@@ -436,7 +454,6 @@ func (um *UpbitMonitor) processAnnouncements(body io.Reader) {
                 // Rule 5: Extract tickers
                 tickers := extractTickers(title)
                 if len(tickers) > 0 {
-                        log.Printf("✅ Valid listing detected: '%s' → Tickers: %v", title, tickers)
                         for _, ticker := range tickers {
                                 newTickers[ticker] = true
                                 newTickersList = append(newTickersList, ticker)
@@ -471,8 +488,6 @@ func (um *UpbitMonitor) processAnnouncements(body io.Reader) {
         for ticker := range newTickers {
                 um.cachedTickers[ticker] = true
         }
-        
-        log.Printf("📊 Cached tickers count: %d, Current API response: %v", len(um.cachedTickers), newTickersList)
 }
 
 // checkProxy performs a single API check with one proxy
@@ -495,6 +510,11 @@ func (um *UpbitMonitor) checkProxy(proxyURL string, proxyIndex int) {
         req.Header.Del("Origin")
         req.Header.Del("Referer")
         
+        // Add bot prevention headers
+        req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        req.Header.Set("Accept", "application/json, text/plain, */*")
+        req.Header.Set("Accept-Language", "ko-KR,ko;q=0.9,en;q=0.8")
+        
         // Each proxy uses its own ETag for independent caching
         um.etagMu.RLock()
         oldETag := um.proxyETags[proxyIndex]
@@ -513,8 +533,29 @@ func (um *UpbitMonitor) checkProxy(proxyURL string, proxyIndex int) {
 
         switch resp.StatusCode {
         case http.StatusOK:
-                log.Printf("🔥 Proxy #%d: CHANGE DETECTED! Processing...", proxyIndex+1)
                 newETag := resp.Header.Get("ETag")
+                
+                // Check if this ETag change was already processed by another proxy
+                um.lastETagMu.RLock()
+                isAlreadyProcessed := (um.lastProcessedETag == newETag)
+                um.lastETagMu.RUnlock()
+                
+                if isAlreadyProcessed {
+                        // Silent update - another proxy already processed this change
+                        um.etagMu.Lock()
+                        um.proxyETags[proxyIndex] = newETag
+                        um.etagMu.Unlock()
+                        resp.Body.Close()
+                        return
+                }
+                
+                // First to detect - process the change
+                log.Printf("🔥 Proxy #%d: FIRST TO DETECT! Processing...", proxyIndex+1)
+                
+                // Update last processed ETag
+                um.lastETagMu.Lock()
+                um.lastProcessedETag = newETag
+                um.lastETagMu.Unlock()
                 
                 // Save ETag for this specific proxy and log the change atomically
                 um.etagMu.Lock()
@@ -522,24 +563,24 @@ func (um *UpbitMonitor) checkProxy(proxyURL string, proxyIndex int) {
                 um.proxyETags[proxyIndex] = newETag
                 um.etagMu.Unlock()
                 
-                // Log ETag change to etag_news.json (async, with captured oldETag)
+                // Log ETag change to etag_news.jsonl (async, with captured oldETag)
                 go um.logETagChange(proxyIndex, oldETagValue, newETag, responseTime)
                 
                 um.processAnnouncements(resp.Body)
                 resp.Body.Close()
 
         case http.StatusNotModified:
-                log.Printf("✓ Proxy #%d: No change (304)", proxyIndex+1)
+                // Silent - no change detected
                 resp.Body.Close()
 
         case http.StatusTooManyRequests: // 429 - Rate Limited
-                log.Printf("⚠️ Proxy #%d: RATE LIMITED (429) - Blacklisting for 30s", proxyIndex+1)
+                log.Printf("⚠️ Proxy #%d: RATE LIMITED (429) - Cooldown for 30s", proxyIndex+1)
                 resp.Body.Close()
                 
-                // Add to blacklist for 30 seconds
-                um.blacklistMu.Lock()
-                um.proxyBlacklist[proxyIndex] = time.Now().Add(30 * time.Second)
-                um.blacklistMu.Unlock()
+                // Add to cooldown for 30 seconds
+                um.cooldownMu.Lock()
+                um.proxyCooldowns[proxyIndex] = time.Now().Add(30 * time.Second)
+                um.cooldownMu.Unlock()
 
         default:
                 log.Printf("⚠️ Proxy #%d: Unexpected status %d", proxyIndex+1, resp.StatusCode)
@@ -587,10 +628,6 @@ func (um *UpbitMonitor) Start() {
 
         rand.Seed(time.Now().UnixNano())
 
-        // Single ticker for all requests
-        ticker := time.NewTicker(time.Duration(checkIntervalMs) * time.Millisecond)
-        defer ticker.Stop()
-
         // Log pause configuration if enabled
         if um.pauseEnabled {
                 log.Printf("⏸️  PAUSE SCHEDULE ENABLED:")
@@ -602,7 +639,8 @@ func (um *UpbitMonitor) Start() {
 
         log.Println("🚀 Random proxy rotation started!")
 
-        for range ticker.C {
+        // Main loop with random intervals and proactive 3-second cooldown
+        for {
                 // Check if we should pause (timezone-based scheduling)
                 if um.pauseEnabled && um.shouldPauseNow() {
                         um.pauseMu.Lock()
@@ -628,11 +666,12 @@ func (um *UpbitMonitor) Start() {
                 }
                 um.pauseMu.Unlock()
 
-                // Get available (non-blacklisted) proxies
+                // Get available (non-cooldown) proxies
                 availableIndices := um.getAvailableProxies()
                 
                 if len(availableIndices) == 0 {
-                        log.Printf("⚠️ All proxies blacklisted! Skipping this tick...")
+                        // All proxies on cooldown - wait a bit and continue
+                        time.Sleep(time.Duration(250+rand.Intn(100)) * time.Millisecond)
                         continue
                 }
 
@@ -640,8 +679,16 @@ func (um *UpbitMonitor) Start() {
                 randomIndex := availableIndices[rand.Intn(len(availableIndices))]
                 proxyURL := um.proxies[randomIndex]
                 
+                // PROACTIVE 3-SECOND COOLDOWN: Add to cooldown immediately after selection
+                um.cooldownMu.Lock()
+                um.proxyCooldowns[randomIndex] = time.Now().Add(3 * time.Second)
+                um.cooldownMu.Unlock()
+                
                 // Perform check with selected proxy
                 um.checkProxy(proxyURL, randomIndex)
+                
+                // Random sleep between requests (250-350ms)
+                time.Sleep(time.Duration(250+rand.Intn(100)) * time.Millisecond)
         }
 }
 
@@ -660,10 +707,10 @@ func (um *UpbitMonitor) shouldPauseNow() bool {
         return currentMinutes >= um.pauseStart && currentMinutes < um.pauseEnd
 }
 
-// getAvailableProxies returns indices of proxies that are not blacklisted
+// getAvailableProxies returns indices of proxies that are not on cooldown
 func (um *UpbitMonitor) getAvailableProxies() []int {
-        um.blacklistMu.Lock()
-        defer um.blacklistMu.Unlock()
+        um.cooldownMu.Lock()
+        defer um.cooldownMu.Unlock()
 
         now := time.Now()
         var available []int
@@ -671,57 +718,47 @@ func (um *UpbitMonitor) getAvailableProxies() []int {
 
         // First pass: collect available and expired
         for i := range um.proxies {
-                expireTime, isBlacklisted := um.proxyBlacklist[i]
-                if !isBlacklisted {
+                expireTime, isOnCooldown := um.proxyCooldowns[i]
+                if !isOnCooldown {
                         available = append(available, i)
                 } else if now.After(expireTime) {
-                        // Blacklist expired
+                        // Cooldown expired
                         expired = append(expired, i)
                         available = append(available, i)
                 }
         }
 
-        // Clean up expired blacklist entries
+        // Clean up expired cooldown entries
         for _, i := range expired {
-                delete(um.proxyBlacklist, i)
-                log.Printf("✅ Proxy #%d: Blacklist expired, back in rotation", i+1)
+                delete(um.proxyCooldowns, i)
         }
 
         return available
 }
 
-// appendTradeLog appends a trade execution log entry to the JSON file
+// appendTradeLog appends a trade execution log entry to the JSONL file
 func (um *UpbitMonitor) appendTradeLog(logEntry *TradeExecutionLog) error {
         um.logMu.Lock()
         defer um.logMu.Unlock()
 
-        var logs []TradeExecutionLog
-        
-        // Read existing logs if file exists
-        if _, err := os.Stat(um.executionLogFile); err == nil {
-                fileData, err := os.ReadFile(um.executionLogFile)
-                if err != nil {
-                        return fmt.Errorf("error reading execution log: %v", err)
-                }
-                if len(fileData) > 0 {
-                        json.Unmarshal(fileData, &logs)
-                }
-        }
-
-        // Append new log entry
-        logs = append(logs, *logEntry)
-
-        // Write back to file
-        jsonData, err := json.MarshalIndent(logs, "", "  ")
+        // Append to JSONL file (much faster than reading entire file)
+        file, err := os.OpenFile(um.executionLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
         if err != nil {
-                return fmt.Errorf("error marshaling execution log: %v", err)
+                return fmt.Errorf("error opening execution log file for append: %v", err)
+        }
+        defer file.Close()
+
+        // Marshal entry to JSON and write as single line
+        jsonData, err := json.Marshal(logEntry)
+        if err != nil {
+                return fmt.Errorf("error marshaling execution log entry: %v", err)
         }
 
-        if err := os.WriteFile(um.executionLogFile, jsonData, 0644); err != nil {
-                return fmt.Errorf("error writing execution log: %v", err)
+        if _, err := file.Write(append(jsonData, '\n')); err != nil {
+                return fmt.Errorf("error writing to execution log file: %v", err)
         }
 
-        log.Printf("📊 Trade execution log saved for %s", logEntry.Ticker)
+        log.Printf("📊 Trade execution log saved for %s (JSONL format)", logEntry.Ticker)
         return nil
 }
 
@@ -751,6 +788,9 @@ func (um *UpbitMonitor) GetServerTime() (*TimeSyncResult, error) {
         if err != nil {
                 return nil, fmt.Errorf("failed to create request: %w", err)
         }
+
+        // Add User-Agent header for bot prevention
+        req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
         resp, err := client.Do(req)
         if err != nil {
@@ -789,23 +829,10 @@ func (um *UpbitMonitor) GetServerTime() (*TimeSyncResult, error) {
         }, nil
 }
 
-// logETagChange logs ETag change detection events to etag_news.json
+// logETagChange logs ETag change detection events to etag_news.jsonl
 func (um *UpbitMonitor) logETagChange(proxyIndex int, oldETag, newETag string, responseTimeMs int64) error {
         um.logMu.Lock()
         defer um.logMu.Unlock()
-
-        var data ETagChangeData
-        
-        // Read existing logs if file exists
-        if _, err := os.Stat(um.etagLogFile); err == nil {
-                fileData, err := os.ReadFile(um.etagLogFile)
-                if err != nil {
-                        return fmt.Errorf("error reading etag log: %v", err)
-                }
-                if len(fileData) > 0 {
-                        json.Unmarshal(fileData, &data)
-                }
-        }
 
         // Create new log entry
         now := time.Now()
@@ -817,24 +844,28 @@ func (um *UpbitMonitor) logETagChange(proxyIndex int, oldETag, newETag string, r
         logEntry := ETagChangeLog{
                 ProxyIndex:     proxyIndex + 1,
                 ProxyName:      proxyName,
-                DetectedAt:     now.Format("2006-01-02 15:04:05.000"),
-                ServerTime:     now.UTC().Format(time.RFC3339Nano),
+                DetectedAt:     now.In(um.kstLocation).Format("2006-01-02 15:04:05.000"),
+                ServerTime:     now.In(um.kstLocation).Format(time.RFC3339Nano),
                 OldETag:        oldETag,
                 NewETag:        newETag,
                 ResponseTimeMs: responseTimeMs,
         }
 
-        // Append new log entry
-        data.Detections = append(data.Detections, logEntry)
-
-        // Write back to file
-        jsonData, err := json.MarshalIndent(data, "", "  ")
+        // Append to JSONL file (much faster than reading entire file)
+        file, err := os.OpenFile(um.etagLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
         if err != nil {
-                return fmt.Errorf("error marshaling etag log: %v", err)
+                return fmt.Errorf("error opening etag log file for append: %v", err)
+        }
+        defer file.Close()
+
+        // Marshal entry to JSON and write as single line
+        jsonData, err := json.Marshal(logEntry)
+        if err != nil {
+                return fmt.Errorf("error marshaling etag log entry: %v", err)
         }
 
-        if err := os.WriteFile(um.etagLogFile, jsonData, 0644); err != nil {
-                return fmt.Errorf("error writing etag log: %v", err)
+        if _, err := file.Write(append(jsonData, '\n')); err != nil {
+                return fmt.Errorf("error writing to etag log file: %v", err)
         }
 
         // Safely truncate ETags for logging
@@ -852,6 +883,6 @@ func (um *UpbitMonitor) logETagChange(proxyIndex int, oldETag, newETag string, r
                 newETagShort = newETag
         }
         
-        log.Printf("📝 ETag change logged: Proxy #%d, %s -> %s", proxyIndex+1, oldETagShort, newETagShort)
+        log.Printf("📝 ETag change logged: Proxy #%d, %s -> %s (JSONL format)", proxyIndex+1, oldETagShort, newETagShort)
         return nil
 }
