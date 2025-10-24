@@ -1,21 +1,23 @@
 package main
 
 import (
-        "bufio"
-        "fmt"
-        "io"
-        json "github.com/json-iterator/go"
-        "log"
-        "math/rand"
-        "net/http"
-        "net/url"
-        "os"
-        "regexp"
-        "strings"
-        "sync"
-        "time"
+	"bufio"
+	"crypto/tls"
+	"fmt"
+	"io"
+	json "github.com/json-iterator/go"
+	"log"
+	"math/rand"
+	"net/http"
+	"net/http/cookiejar"
+	"net/url"
+	"os"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
 
-        "golang.org/x/net/proxy"
+	"golang.org/x/net/proxy"
 )
 
 type UpbitAPIResponse struct {
@@ -63,36 +65,40 @@ type ETagChangeLog struct {
 }
 
 
-type UpbitMonitor struct {
-        apiURL           string
-        proxies          []string
-        tickerRegex      *regexp.Regexp
-        cachedTickers    map[string]bool
-        proxyETags       map[int]string // Each proxy has its own ETag
-        etagMu           sync.RWMutex   // Separate mutex for ETag operations
-        proxyIndex       int
-        mu               sync.Mutex
-        jsonFile         string
-        onNewListing     func(symbol string) // Callback for new listings
-        executionLogFile string
-        etagLogFile      string // ETag change detection log
-        currentLogEntry  *TradeExecutionLog
-        logMu            sync.Mutex
-        // Intelligent Proxy Pool (Cooldowns for all proxies)
-        proxyCooldowns   map[int]time.Time // proxy index -> cooldown expire time
-        cooldownMu       sync.RWMutex
-        // Timezone-based Scheduling
-        pauseEnabled     bool
-        pauseStart       int // Minutes since midnight (e.g., 13:00 = 780)
-        pauseEnd         int // Minutes since midnight (e.g., 03:00 = 180)
-        timezone         *time.Location
-        isPaused         bool
-        pauseMu          sync.Mutex
-        // KST timezone for timestamps
-        kstLocation      *time.Location
-        // ETag processing control
-        lastProcessedETag string
-        etagProcessMu     sync.Mutex
+	type UpbitMonitor struct {
+	apiURL           string
+	proxies          []string
+	tickerRegex      *regexp.Regexp
+	cachedTickers    map[string]bool
+	proxyETags       map[int]string // Each proxy has its own ETag
+	etagMu           sync.RWMutex   // Separate mutex for ETag operations
+	proxyIndex       int
+	mu               sync.Mutex
+	jsonFile         string
+	onNewListing     func(symbol string) // Callback for new listings
+	executionLogFile string
+	etagLogFile      string // ETag change detection log
+	currentLogEntry  *TradeExecutionLog
+	logMu            sync.Mutex
+	// Intelligent Proxy Pool (Cooldowns for all proxies)
+	proxyCooldowns   map[int]time.Time // proxy index -> cooldown expire time
+	cooldownMu       sync.RWMutex
+	// Timezone-based Scheduling
+	pauseEnabled     bool
+	pauseStart       int // Minutes since midnight (e.g., 13:00 = 780)
+	pauseEnd         int // Minutes since midnight (e.g., 03:00 = 180)
+	timezone         *time.Location
+	isPaused         bool
+	pauseMu          sync.Mutex
+	// KST timezone for timestamps
+	kstLocation      *time.Location
+	// ETag processing control
+	lastProcessedETag string
+	etagProcessMu     sync.Mutex
+	// Bot detection bypass
+	userAgents        []string
+	userAgentMu       sync.Mutex
+	userAgentIndex    int
 }
 
 func NewUpbitMonitor(onNewListing func(string)) *UpbitMonitor {
@@ -139,25 +145,48 @@ func NewUpbitMonitor(onNewListing func(string)) *UpbitMonitor {
                 kstLocation = time.UTC
         }
 
-        return &UpbitMonitor{
-                apiURL:           "https://api-manager.upbit.com/api/v1/announcements?os=web&page=1&per_page=20&category=overall",
-                proxies:          proxies,
-                tickerRegex:      regexp.MustCompile(`\(([A-Z]{2,6})\)`), // Only 2-6 uppercase letters (valid tickers)
-                cachedTickers:    make(map[string]bool),
-                proxyETags:       make(map[int]string), // Initialize ETag map for each proxy
-                proxyIndex:       0,
-                jsonFile:         "upbit_new.json",
-                executionLogFile: "trade_execution_log.json",
-                proxyCooldowns:   make(map[int]time.Time), // Initialize cooldowns
-                etagLogFile:      "etag_news.json",
-                onNewListing:     onNewListing,
-                pauseEnabled:     pauseEnabled,
-                pauseStart:       pauseStart,
-                pauseEnd:         pauseEnd,
-                timezone:         timezone,
-                isPaused:         false,
-                kstLocation:      kstLocation,
-        }
+	// Realistic User-Agent pool (latest browsers)
+	userAgents := []string{
+		// Chrome on Windows
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+		// Chrome on macOS
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+		// Firefox on Windows
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+		// Firefox on macOS
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
+		// Safari on macOS
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+		// Edge on Windows
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+	}
+
+	return &UpbitMonitor{
+		apiURL:           "https://api-manager.upbit.com/api/v1/announcements?os=web&page=1&per_page=20&category=overall",
+		proxies:          proxies,
+		tickerRegex:      regexp.MustCompile(`\(([A-Z]{2,6})\)`), // Only 2-6 uppercase letters (valid tickers)
+		cachedTickers:    make(map[string]bool),
+		proxyETags:       make(map[int]string), // Initialize ETag map for each proxy
+		proxyIndex:       0,
+		jsonFile:         "upbit_new.json",
+		executionLogFile: "trade_execution_log.json",
+		proxyCooldowns:   make(map[int]time.Time), // Initialize cooldowns
+		etagLogFile:      "etag_news.json",
+		onNewListing:     onNewListing,
+		pauseEnabled:     pauseEnabled,
+		pauseStart:       pauseStart,
+		pauseEnd:         pauseEnd,
+		timezone:         timezone,
+		isPaused:         false,
+		kstLocation:      kstLocation,
+		userAgents:       userAgents,
+		userAgentIndex:   0,
+	}
 }
 
 // parseTimeToMinutes converts "HH:MM" to minutes since midnight
@@ -185,26 +214,66 @@ func parseTimeToMinutes(timeStr string, defaultMinutes int) int {
 }
 
 func (um *UpbitMonitor) createProxyClient(proxyURL string) (*http.Client, error) {
-        parsedURL, err := url.Parse(proxyURL)
-        if err != nil {
-                return nil, fmt.Errorf("proxy URL'si ayrıştırılamadı: %w", err)
-        }
+	parsedURL, err := url.Parse(proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("proxy URL'si ayrıştırılamadı: %w", err)
+	}
 
-        dialer, err := proxy.FromURL(parsedURL, proxy.Direct)
-        if err != nil {
-                return nil, fmt.Errorf("proxy dialer oluşturulamadı: %w", err)
-        }
+	dialer, err := proxy.FromURL(parsedURL, proxy.Direct)
+	if err != nil {
+		return nil, fmt.Errorf("proxy dialer oluşturulamadı: %w", err)
+	}
 
-        transport := &http.Transport{
-                Dial: dialer.Dial,
-        }
+	// TLS configuration to mimic real browsers and avoid fingerprinting
+	tlsConfig := &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		MaxVersion:         tls.VersionTLS13,
+		InsecureSkipVerify: false, // Keep certificate validation
+		// Cipher suites matching modern browsers
+		CipherSuites: []uint16{
+			tls.TLS_AES_128_GCM_SHA256,
+			tls.TLS_AES_256_GCM_SHA384,
+			tls.TLS_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		},
+	}
 
-        client := &http.Client{
-                Transport: transport,
-                Timeout:   10 * time.Second,
-        }
+	transport := &http.Transport{
+		Dial:              dialer.Dial,
+		TLSClientConfig:   tlsConfig,
+		DisableKeepAlives: false, // Enable keep-alive like real browsers
+		MaxIdleConns:      100,
+		IdleConnTimeout:   90 * time.Second,
+	}
 
-        return client, nil
+	// Create cookie jar for session persistence
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, fmt.Errorf("cookie jar oluşturulamadı: %w", err)
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Second,
+		Jar:       jar, // Enable cookie handling
+	}
+
+	return client, nil
+}
+
+// getRandomUserAgent returns a random User-Agent from the pool
+func (um *UpbitMonitor) getRandomUserAgent() string {
+	um.userAgentMu.Lock()
+	defer um.userAgentMu.Unlock()
+	
+	// Rotate through user agents
+	userAgent := um.userAgents[um.userAgentIndex]
+	um.userAgentIndex = (um.userAgentIndex + 1) % len(um.userAgents)
+	
+	return userAgent
 }
 
 func (um *UpbitMonitor) loadExistingData() error {
@@ -490,20 +559,42 @@ func (um *UpbitMonitor) checkProxy(proxyURL string, proxyIndex int) {
 
         requestStart := time.Now()
         
-        req, err := http.NewRequest("GET", um.apiURL, nil)
-        if err != nil {
-                log.Printf("❌ Proxy #%d: Request creation failed: %v", proxyIndex+1, err)
-                return
-        }
+	req, err := http.NewRequest("GET", um.apiURL, nil)
+	if err != nil {
+		log.Printf("❌ Proxy #%d: Request creation failed: %v", proxyIndex+1, err)
+		return
+	}
 
-        // Bot detection prevention headers
-        req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-        req.Header.Set("Accept", "application/json, text/plain, */*")
-        req.Header.Set("Accept-Language", "ko-KR,ko;q=0.9,en;q=0.8")
-        
-        // CRITICAL: Remove Origin header to avoid 1 req/10s limit
-        req.Header.Del("Origin")
-        req.Header.Del("Referer")
+	// ============================================
+	// COMPREHENSIVE BOT DETECTION BYPASS HEADERS
+	// ============================================
+	
+	// 1. Realistic User-Agent (rotated from pool)
+	req.Header.Set("User-Agent", um.getRandomUserAgent())
+	
+	// 2. Accept headers (matching real browser behavior)
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	
+	// 3. Referer and Origin (simulate coming from Upbit website)
+	req.Header.Set("Referer", "https://upbit.com/")
+	req.Header.Set("Origin", "https://upbit.com")
+	
+	// 4. Sec-Fetch-* headers (modern browser security features)
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-site")
+	
+	// 5. Connection settings (like real browsers)
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Pragma", "no-cache")
+	
+	// 6. Additional browser-like headers
+	req.Header.Set("Sec-Ch-Ua", "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\"")
+	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	req.Header.Set("Sec-Ch-Ua-Platform", "\"Windows\"")
         
         // Each proxy uses its own ETag for independent caching
         um.etagMu.RLock()
@@ -621,10 +712,11 @@ func (um *UpbitMonitor) Start() {
                                         now.Format("15:04:05"), um.timezone.String())
                                 log.Printf("   Will resume at %02d:%02d %s", 
                                         um.pauseEnd/60, um.pauseEnd%60, um.timezone.String())
-                        }
-                        um.pauseMu.Unlock()
-                        time.Sleep(time.Duration(250+rand.Intn(100)) * time.Millisecond)
-                        continue
+				}
+			um.pauseMu.Unlock()
+			// During pause, sleep with more variation
+			time.Sleep(time.Duration(5000+rand.Intn(5000)) * time.Millisecond) // 5-10 seconds
+			continue
                 }
 
                 // Check if we just resumed
@@ -637,13 +729,14 @@ func (um *UpbitMonitor) Start() {
                 }
                 um.pauseMu.Unlock()
 
-                // Get available (non-cooling down) proxies
-                availableIndices := um.getAvailableProxies()
-                
-                if len(availableIndices) == 0 {
-                        time.Sleep(time.Duration(250+rand.Intn(100)) * time.Millisecond)
-                        continue
-                }
+		// Get available (non-cooling down) proxies
+		availableIndices := um.getAvailableProxies()
+		
+		if len(availableIndices) == 0 {
+			// No proxies available, wait with randomization
+			time.Sleep(time.Duration(250+rand.Intn(150)) * time.Millisecond)
+			continue
+		}
 
                 // Pick random proxy from available pool
                 randomIndex := availableIndices[rand.Intn(len(availableIndices))]
@@ -654,11 +747,24 @@ func (um *UpbitMonitor) Start() {
                 um.proxyCooldowns[randomIndex] = time.Now().Add(3 * time.Second)
                 um.cooldownMu.Unlock()
                 
-                // Perform check with selected proxy
-                um.checkProxy(proxyURL, randomIndex)
-                
-                // Random stagger: 250-350ms
-                time.Sleep(time.Duration(250+rand.Intn(100)) * time.Millisecond)
+		// Add random pre-request delay (human-like behavior)
+		// Small jitter before request: 10-50ms
+		preDelay := time.Duration(10+rand.Intn(40)) * time.Millisecond
+		time.Sleep(preDelay)
+		
+		// Perform check with selected proxy
+		um.checkProxy(proxyURL, randomIndex)
+		
+		// Random stagger with more variation: 250-400ms (more human-like)
+		// Occasionally add longer pauses to mimic human behavior
+		baseDelay := 250 + rand.Intn(150) // 250-400ms
+		
+		// 10% chance of longer pause (0.5-1.5 seconds) to mimic human reading/thinking
+		if rand.Float32() < 0.10 {
+			baseDelay = 500 + rand.Intn(1000) // 500-1500ms
+		}
+		
+		time.Sleep(time.Duration(baseDelay) * time.Millisecond)
         }
 }
 
@@ -754,13 +860,22 @@ func (um *UpbitMonitor) GetServerTime() (*TimeSyncResult, error) {
                 client = &http.Client{Timeout: 10 * time.Second}
         }
 
-        req, err := http.NewRequest("GET", um.apiURL, nil)
-        if err != nil {
-                return nil, fmt.Errorf("failed to create request: %w", err)
-        }
+	req, err := http.NewRequest("GET", um.apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
 
-        // Add User-Agent header for bot detection prevention
-        req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+	// Apply comprehensive bot detection bypass headers
+	req.Header.Set("User-Agent", um.getRandomUserAgent())
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("Referer", "https://upbit.com/")
+	req.Header.Set("Origin", "https://upbit.com")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-site")
+	req.Header.Set("Connection", "keep-alive")
 
         resp, err := client.Do(req)
         if err != nil {
